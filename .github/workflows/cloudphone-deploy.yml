@@ -1,0 +1,125 @@
+name: Proton Cloudphone Deployment (DASHBOARD)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/cloudphone-deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Preflight Environment Check
+      run: |
+        echo "======================================================"
+        echo "   PROTON CLOUDPHONE // DASHBOARD // ANDROID 16"
+        echo "======================================================="
+        echo "[INFO] Arch : $(uname -m)"
+        echo "[INFO] OS   : $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
+        echo "[INFO] PID1 : $(cat /proc/1/comm)"
+        if [ -e /dev/kvm ]; then
+          echo "[OK] KVM acceleration device present."
+        else
+          echo "[WARN] /dev/kvm not present - phone creation may be rejected by the platform."
+        fi
+        echo "[INFO] Disk space:"
+        df -h /
+        echo "[INFO] Node: $(node --version 2>/dev/null || echo 'not found')"
+
+    - name: Download Official Bootstrap (Checksum-Pinned Installer)
+      run: |
+        echo "[INFO] Downloading bootstrap.sh from Silence-X-Proton/cloudphone-platform..."
+        curl --fail --show-error --silent --location --proto "=https" --tlsv1.2 \
+          https://raw.githubusercontent.com/Silence-X-Proton/cloudphone-platform/main/scripts/bootstrap.sh \
+          -o /tmp/cloudphone-bootstrap.sh
+        bash -n /tmp/cloudphone-bootstrap.sh && echo "[OK] Bootstrap syntax verified."
+        sudo chmod +x /tmp/cloudphone-bootstrap.sh
+
+    - name: Install Cloudphone Platform (DASHBOARD Mode)
+      run: |
+        echo "[INFO] Running installer: mode=dashboard port=8790"
+        echo "[INFO] First run downloads pinned Android 16 (API 36) SDK artifacts (~3-5 GB)..."
+        sudo bash /tmp/cloudphone-bootstrap.sh --mode dashboard --port 8790 --accept-host-changes --accept-android-sdk-license
+        echo "[SUCCESS] Cloudphone Platform installed in DASHBOARD mode."
+
+    - name: Locate Generated Admin Credentials
+      run: |
+        echo "[INFO] Installer-generated admin username/password are printed above in the install log."
+        echo "[INFO] Recovering root-only credential records (best effort)..."
+        STATE_DIR=/var/lib/cloudphone-platform
+        if sudo [ -d "$STATE_DIR" ]; then
+          for f in $(sudo find "$STATE_DIR" -maxdepth 3 -type f \( -iname '*credential*' -o -iname '*admin*' -o -iname '*auth*' \) 2>/dev/null | head -5); do
+            echo "--- $f ---"
+            sudo cat "$f" 2>/dev/null || true
+          done
+        else
+          echo "[WARN] State directory $STATE_DIR not found (credentials may live elsewhere)."
+        fi
+
+    - name: Install Tunnel Protocol
+      run: |
+        if ! command -v cloudflared >/dev/null 2>&1; then
+          echo "[INFO] Downloading cloudflared..."
+          sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+        fi
+
+    - name: Start Assigned Tunnel
+      run: |
+        echo "[INFO] Starting Cloudflare Quick Tunnel on port 8790..."
+        if ! command -v cloudflared >/dev/null 2>&1; then
+          echo "[WARN] cloudflared missing - re-downloading..."
+          sudo curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+        fi
+        nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8790 > /tmp/tunnel.log 2>&1 &
+        TUNNEL_URL=""
+        for i in $(seq 1 60); do
+          sleep 2
+          TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -1 || true)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            break
+          fi
+        done
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "[ERROR] Tunnel could not be established. Tunnel log:"
+          cat /tmp/tunnel.log 2>/dev/null || true
+          exit 1
+        fi
+
+    - name: Output Connection Details
+      run: |
+        echo "======================================================"
+        echo "        PROTON CLOUDPHONE DASHBOARD IS LIVE"
+        echo "======================================================="
+        echo "Access URL : $TUNNEL_URL"
+        echo "Mode       : dashboard"
+        echo "Web Port   : 8790 (loopback, proxied via tunnel)"
+        echo "Login      : installer-generated admin username/password (see install log)"
+        echo "Phone Keys : admin-only reveal per phone (dashboard mode)"
+        echo "======================================================="
+        echo "### Proton Cloudphone // DASHBOARD" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**OPEN CLOUDPHONE: $TUNNEL_URL**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| Platform | Android 16 (API 36) KVM emulator |" >> $GITHUB_STEP_SUMMARY
+        echo "| Transport | scrcpy H.264 over authenticated WSS |" >> $GITHUB_STEP_SUMMARY
+        echo "| Mode | dashboard |" >> $GITHUB_STEP_SUMMARY
+        echo "| Web Port | 8790 (loopback) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Tunnel | Cloudflare Quick Tunnel |" >> $GITHUB_STEP_SUMMARY
+        echo "::notice title=Cloudphone DASHBOARD is LIVE::$TUNNEL_URL"
+
+    - name: Keep Alive Monitor
+      run: |
+        echo "[INFO] Cloudphone DASHBOARD session active for 6 hours max..."
+        echo "[INFO] Live URL: $TUNNEL_URL"
+        for i in {355..1}; do
+          sleep 60
+        done
